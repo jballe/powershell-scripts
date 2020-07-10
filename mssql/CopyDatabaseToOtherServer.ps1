@@ -8,7 +8,12 @@ param(
     $TargetPath="R:\",
     $DatabasePrefix="", # eg. tyg-
     $DatabaseSuffix="", # eg. (master|core|web)
-    $SqlCmd = "C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\130\Tools\Binn\sqlcmd.exe"
+    $SqlCmd = "C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\130\Tools\Binn\sqlcmd.exe",
+
+    [Switch]$SkipBackup,
+    [Switch]$SkipCopy,
+    [Switch]$SkipRemoveOld,
+    [Switch]$SkipRestore
 )
 
 $ErrorActionPreference = "STOP"
@@ -19,34 +24,62 @@ If (Get-Module SQLSERVER -ListAvailable) {
     Install-Module SQLSERVER 
 }
 
-Set-Location SQLSERVER:\SQL\$SourceServer\$SourceInstance
-$databases = Get-SqlDatabase | Select-Object -ExpandProperty Name `
-                | Where-Object { $_ -imatch "${DatabasePrefix}.+" -and $_ -imatch ".+${DatabaseSuffix}" }
+    If(-not (Test-Path $TargetPath)) {
+        New-Item $TargetPath -ItemType Directory | Out-Null
+    }
 
-# Backup
-$databases | ForEach-Object {
-    $databaseName = $_
-    $bakFile = "${databaseName}.bak"
-    $file = "${SourceUnc}\${bakFile}"
-    Write-Host "Backup ${databaseName} to ${file}"
-    Backup-SqlDatabase -Database $databaseName -BackupFile $file -CopyOnly
+try {
+    Push-Location SQLSERVER:\SQL\$SourceServer\$SourceInstance
+    $databases = Get-SqlDatabase | Select-Object -ExpandProperty Name `
+                    | Where-Object { $_ -imatch "${DatabasePrefix}.+" -and $_ -imatch ".+${DatabaseSuffix}" }
+
+    # Backup
+    If(-not $SkipBackup) {
+        $databases | ForEach-Object {
+            $databaseName = $_
+            $bakFile = "${databaseName}.bak"
+            $file = "${SourceUnc}\${bakFile}"
+            Write-Host "Backup ${databaseName} to ${file}"
+            Backup-SqlDatabase -Database $databaseName -BackupFile $file -CopyOnly
+        }
+    }
+} finally {
+    Pop-Location
 }
 
-Set-Location SQLSERVER:\SQL\$TargetServer\$TargetInstance -ErrorAction Break
-$databases | ForEach-Object {
-    $databaseName = $_
-    $bakFile = "${databaseName}.bak"
-    $file = "${SourceUnc}\${bakFile}"
 
-    # Copy
-    Copy-Item -Path $file -Destination $TargetFolder -Verbose
 
-    # Restore
-    $file = Join-Path $TargetFolder $bakFile
-    Write-Host "Removing old database"
-    Invoke-Sqlcmd -Query "EXEC msdb.dbo.sp_delete_database_backuphistory @database_name = N'${databaseName}'"
-    Invoke-Sqlcmd -Query "ALTER DATABASE [${databaseName}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE"
-    Invoke-Sqlcmd -Query "DROP DATABASE IF EXISTS [${databaseName}]"
+try {
+    Push-Location SQLSERVER:\SQL\$TargetServer\$TargetInstance -ErrorAction Stop
+    $databases | ForEach-Object {
+        $databaseName = $_
+        $bakFile = "${databaseName}.bak"
 
-    Restore-SqlDatabase -Database $databaseName -BackupFile $file -AutoRelocate
+        # Copy
+        if(-not $SkipCopy) {
+            $ErrorActionPreference = "Continue"
+            & robocopy ${SourceUnc} $TargetPath $bakFile /NFL /NDL /NC /NS /NP /NJH /NJS
+            $ErrorActionPreference = "Stop"
+        }
+
+        $file = Join-Path $TargetPath $bakFile -Resolve
+
+        # Restore
+        If(-not $SkipRemoveOld) {
+            $file = Join-Path $TargetFolder $bakFile
+            Write-Host "Removing old $databaseName"
+            $ErrorActionPreference = "SilentlyContinue"
+            Invoke-Sqlcmd -Query "EXEC msdb.dbo.sp_delete_database_backuphistory @database_name = N'${databaseName}'"
+            Invoke-Sqlcmd -Query "ALTER DATABASE [${databaseName}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE"
+            Invoke-Sqlcmd -Query "DROP DATABASE IF EXISTS [${databaseName}]"
+            $ErrorActionPreference = "Stop"
+        }
+
+        If(-not $SkipRestore) {
+            Write-Host "Restore $databaseName"
+            Restore-SqlDatabase -Database $databaseName -BackupFile $file -AutoRelocate
+        }
+    }
+} finally {
+    Pop-Location
 }
